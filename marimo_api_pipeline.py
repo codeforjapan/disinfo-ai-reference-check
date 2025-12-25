@@ -81,8 +81,10 @@ def _(display, json, pd):
 
         # プロバイダ
         "openai_model": "gpt-4o-mini",
+        "claude_model": "claude-3-5-sonnet-latest",
         "gemini_model": "gemini-2.5-flash",
         "perplexity_model": "sonar-pro",
+        "xai_model": "grok-4",
 
         # 任意: Perplexity の extra_body
         "perplexity_extra_body": {},
@@ -157,10 +159,22 @@ def _(Any, CFG, Dict, Optional, dataclass, field):
             base_url=None,
         ),
         ProviderConfig(
+            name="claude",
+            api_key_env="ANTHROPIC_API_KEY",
+            model=CFG["claude_model"],
+            base_url="https://api.anthropic.com/v1",
+        ),
+        ProviderConfig(
             name="gemini",
             api_key_env="GEMINI_API_KEY",
             model=CFG["gemini_model"],
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        ),
+        ProviderConfig(
+            name="xai",
+            api_key_env="XAI_API_KEY",
+            model=CFG["xai_model"],
+            base_url="https://api.x.ai/v1",
         ),
         ProviderConfig(
             name="perplexity",
@@ -481,7 +495,9 @@ def _(CFG, Path, display, pd):
     output_dir = Path(CFG["output_dir"])
     paths = {
         "openai": output_dir / "openai.csv",
+        "claude": output_dir / "claude.csv",
         "gemini": output_dir / "gemini.csv",
+        "xai": output_dir / "xai.csv",
         "perplexity": output_dir / "perplexity.csv",
     }
     csv_columns = [

@@ -135,6 +135,32 @@ def _(display, json, pd):
 
 
 @app.cell
+def _():
+    CSV_COLUMNS = [
+        "run_id",
+        "prompt_id",
+        "requested_at",
+        "provider",
+        "model",
+        "base_url",
+        "note_id",
+        "note_text",
+        "system_prompt",
+        "user_prompt",
+        "response_text",
+        "finish_reason",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "latency_ms",
+        "search_results_json",
+        "error",
+        "raw_json",
+    ]
+    return (CSV_COLUMNS,)
+
+
+@app.cell
 def _(CFG, Path, pd):
     def load_input_csv(cfg):
         input_csv = Path(cfg["input_csv"])
@@ -310,6 +336,7 @@ def _(
     Any,
     AsyncOpenAI,
     CFG,
+    CSV_COLUMNS,
     Dict,
     List,
     Optional,
@@ -353,6 +380,19 @@ def _(
             if base_url:
                 kwargs["base_url"] = base_url
             return AsyncOpenAI(**kwargs)
+
+        def _make_openai_client_local(api_key: str, cfg: Any) -> AsyncOpenAI:
+            return _make_client_local(api_key, cfg.base_url)
+
+        def _make_anthropic_client_local(api_key: str, cfg: Any) -> Any:
+            from anthropic import AsyncAnthropic  # type: ignore
+
+            return AsyncAnthropic(api_key=api_key)
+
+        def _make_gemini_client_local(api_key: str, cfg: Any) -> Any:
+            from google import genai  # type: ignore
+
+            return genai.Client(api_key=api_key)
 
         def _safe_format_local(template: str, **kwargs: Any) -> str:
             safe_kwargs = {}
@@ -830,27 +870,16 @@ def _(
                     "raw_json": _dump_response_local(resp),
                 }
 
-        CSV_COLUMNS = [
-            "run_id",
-            "prompt_id",
-            "requested_at",
-            "provider",
-            "model",
-            "base_url",
-            "note_id",
-            "note_text",
-            "system_prompt",
-            "user_prompt",
-            "response_text",
-            "finish_reason",
-            "prompt_tokens",
-            "completion_tokens",
-            "total_tokens",
-            "latency_ms",
-            "search_results_json",
-            "error",
-            "raw_json",
-        ]
+        CLIENT_FACTORIES = {
+            "openai": _make_openai_client_local,
+            "anthropic": _make_anthropic_client_local,
+            "gemini": _make_gemini_client_local,
+        }
+        ADAPTER_CLASSES = {
+            "openai": OpenAIAdapter,
+            "anthropic": AnthropicAdapter,
+            "gemini": GeminiAdapter,
+        }
 
         out_dir = Path(CFG["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -869,9 +898,7 @@ def _(
         template = CFG["user_prompt_template"]
         note_text_col = CFG["note_text_col"]
         note_id_col = CFG["note_id_col"]
-        openai_clients: Dict[str, AsyncOpenAI] = {}
-        anthropic_clients: Dict[str, Any] = {}
-        gemini_clients: Dict[str, Any] = {}
+        clients_by_type: Dict[str, Dict[str, Any]] = {}
         provider_errors: Dict[str, str] = {}
         try:
             for cfg in PROVIDERS:
@@ -880,62 +907,37 @@ def _(
                 except RuntimeError as e:
                     provider_errors[cfg.name] = str(e)
                     continue
+                factory = CLIENT_FACTORIES.get(cfg.client_type)
+                if factory is None:
+                    provider_errors[cfg.name] = f"不明なclient_type: {cfg.client_type}"
+                    continue
                 try:
-                    if cfg.client_type == "openai":
-                        openai_clients[cfg.name] = _make_client_local(
-                            api_key, cfg.base_url
-                        )
-                    elif cfg.client_type == "anthropic":
-                        try:
-                            from anthropic import AsyncAnthropic  # type: ignore
-                        except Exception as e:
-                            provider_errors[cfg.name] = f"ImportError: {e}"
-                            continue
-                        anthropic_clients[cfg.name] = AsyncAnthropic(api_key=api_key)
-                    elif cfg.client_type == "gemini":
-                        try:
-                            from google import genai  # type: ignore
-                        except Exception as e:
-                            provider_errors[cfg.name] = f"ImportError: {e}"
-                            continue
-                        gemini_clients[cfg.name] = genai.Client(api_key=api_key)
-                    else:
-                        provider_errors[cfg.name] = (
-                            f"不明なclient_type: {cfg.client_type}"
-                        )
+                    client = factory(api_key, cfg)
                 except Exception as e:
-                    provider_errors[cfg.name] = f"{type(e).__name__}: {e}"
+                    label = "ImportError" if isinstance(e, ImportError) else type(e).__name__
+                    provider_errors[cfg.name] = f"{label}: {e}"
+                    continue
+                clients_by_type.setdefault(cfg.client_type, {})[cfg.name] = client
 
             sem = asyncio.Semaphore(int(CFG["max_concurrency"]))
             records = df_in.to_dict(orient="records")
             batch_size = max(1, int(CFG["batch_size"]))
-            client_maps = {
-                "openai": openai_clients,
-                "anthropic": anthropic_clients,
-                "gemini": gemini_clients,
-            }
             adapters: Dict[str, ProviderAdapter] = {}
 
-            def _make_adapter_local(
-                cfg: Any,
-                client: Any,
-                semaphore: asyncio.Semaphore,
-            ) -> Optional[ProviderAdapter]:
-                if cfg.client_type == "openai":
-                    return OpenAIAdapter(cfg, client, semaphore)
-                if cfg.client_type == "anthropic":
-                    return AnthropicAdapter(cfg, client, semaphore)
-                if cfg.client_type == "gemini":
-                    return GeminiAdapter(cfg, client, semaphore)
-                return None
-
             for cfg in PROVIDERS:
-                client = client_maps.get(cfg.client_type, {}).get(cfg.name)
-                if client is None:
+                if cfg.name in provider_errors:
                     continue
-                adapter = _make_adapter_local(cfg, client, sem)
-                if adapter is not None:
-                    adapters[cfg.name] = adapter
+                client = clients_by_type.get(cfg.client_type, {}).get(cfg.name)
+                if client is None:
+                    provider_errors[cfg.name] = "クライアントが初期化されていません"
+                    continue
+                adapter_cls = ADAPTER_CLASSES.get(cfg.client_type)
+                if adapter_cls is None:
+                    provider_errors[cfg.name] = (
+                        f"アダプタが未登録です: {cfg.client_type}"
+                    )
+                    continue
+                adapters[cfg.name] = adapter_cls(cfg, client, sem)
 
             for start in range(0, len(records), batch_size):
                 batch = records[start : start + batch_size]
@@ -1031,9 +1033,9 @@ def _(
                     f"batch done rows {start + 1}-{start + len(batch)}"
                 )
         finally:
-            for client in openai_clients.values():
+            for client in clients_by_type.get("openai", {}).values():
                 await client.close()
-            for client in anthropic_clients.values():
+            for client in clients_by_type.get("anthropic", {}).values():
                 close_fn = getattr(client, "aclose", None) or getattr(
                     client, "close", None
                 )
@@ -1071,40 +1073,13 @@ async def _(CFG, df_in, run_pipeline):
 
 
 @app.cell
-def _(CFG, Path, display, pd):
+def _(CFG, CSV_COLUMNS, PROVIDERS, Path, display, pd):
     output_dir = Path(CFG["output_dir"])
-    paths = {
-        "openai": output_dir / "openai.csv",
-        "claude": output_dir / "claude.csv",
-        "gemini": output_dir / "gemini.csv",
-        "xai": output_dir / "xai.csv",
-        "perplexity": output_dir / "perplexity.csv",
-    }
-    csv_columns = [
-        "run_id",
-        "prompt_id",
-        "requested_at",
-        "provider",
-        "model",
-        "base_url",
-        "note_id",
-        "note_text",
-        "system_prompt",
-        "user_prompt",
-        "response_text",
-        "finish_reason",
-        "prompt_tokens",
-        "completion_tokens",
-        "total_tokens",
-        "latency_ms",
-        "search_results_json",
-        "error",
-        "raw_json",
-    ]
+    paths = {cfg.name: output_dir / f"{cfg.name}.csv" for cfg in PROVIDERS}
     for name, path in paths.items():
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
-            df_out = pd.DataFrame(columns=csv_columns)
+            df_out = pd.DataFrame(columns=CSV_COLUMNS)
             df_out.to_csv(path, index=False)
             print(f"{name}: CSVが見つからないため空のCSVを作成しました -> {path}")
             display(df_out)

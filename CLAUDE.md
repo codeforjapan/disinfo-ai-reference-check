@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Constitution**: Development principles are defined in `.specify/memory/constitution.md`. All code changes must comply with these principles.
+
 ## Project Overview
 
 This is a disinformation research pipeline that queries multiple LLM providers (OpenAI, Anthropic/Claude, Google Gemini, xAI/Grok, Perplexity) with narrative prompts from a CSV file and collects their responses with web search capabilities. The tool is designed to evaluate how different AI models respond to fact-checking queries about potentially false narratives.
@@ -162,3 +164,10 @@ Primary libraries:
 2. **Provider Isolation**: If a provider's SDK is not installed, that provider will be skipped with an error recorded in the output CSV. At least one provider SDK must be installed for the pipeline to function.
 
 3. **Marimo Display**: When running in script mode (`python marimo_api_pipeline.py`), the final cell that displays CSV results may cause the script to hang. This is a known issue with the `display()` function in non-interactive environments.
+
+## Active Technologies
+- Python 3.11+ (existing marimo_api_pipeline.py uses Python 3.11+ features) + marimo>=0.18.4, pandas>=2.3.3, openai>=2.14.0, anthropic>=0.75.0, google-genai>=1.56.0, python-dotenv>=1.0.0, urllib.parse (stdlib) (001-csv-schema-redesign)
+- CSV files (provider-specific output files in llm_runs/ directory) (001-csv-schema-redesign)
+
+## Recent Changes
+- 001-csv-schema-redesign: Added Python 3.11+ (existing marimo_api_pipeline.py uses Python 3.11+ features) + marimo>=0.18.4, pandas>=2.3.3, openai>=2.14.0, anthropic>=0.75.0, google-genai>=1.56.0, python-dotenv>=1.0.0, urllib.parse (stdlib)

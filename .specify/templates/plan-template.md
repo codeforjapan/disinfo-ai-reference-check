@@ -31,7 +31,21 @@
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-[Gates determined based on constitution file]
+Verify compliance with constitution principles (see `.specify/memory/constitution.md`):
+
+- [ ] **Notebook-First Development**: Feature works in `marimo edit`, `marimo run`, and `python` modes
+- [ ] **Provider Adapter Pattern**: New providers use adapter interface; no pipeline logic changes
+- [ ] **Async-First with Structured Concurrency**: All I/O uses asyncio; shared semaphore; error isolation
+- [ ] **Incremental Data Persistence**: Results written immediately per response; no memory batching
+- [ ] **Configuration-Driven Safety Gates**: Execution requires dual confirmation; parameters in CFG
+- [ ] **Error Transparency**: Errors captured with context; structured error fields in output
+- [ ] **Prompt Reproducibility**: Prompts from CFG templates; recorded in output
+- [ ] **Input Validation**: Empty inputs caught early; descriptive errors
+- [ ] **Output Schema Stability**: CSV_COLUMNS unchanged or migration documented
+- [ ] **Cell Organization**: Config/functions/execution/display cells separated
+- [ ] **Dependency Management**: Optional deps fail gracefully; requirements.txt updated
+
+**Violations**: [List any justified violations with rationale]
 
 ## Project Structure
 

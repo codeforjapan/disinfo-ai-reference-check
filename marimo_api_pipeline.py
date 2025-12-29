@@ -10,12 +10,14 @@ def _():
     import csv
     import json
     import os
+    import re
     import time
     import uuid
     from dataclasses import dataclass, field
     from datetime import datetime, timezone
     from pathlib import Path
     from typing import Any, Dict, List, Optional
+    from urllib.parse import urlparse
 
     import pandas as pd
     from IPython.display import display
@@ -54,8 +56,10 @@ def _():
         json,
         os,
         pd,
+        re,
         time,
         timezone,
+        urlparse,
         uuid,
     )
 
@@ -71,6 +75,8 @@ def _(display, json, pd):
 
         # 出力CSV
         "output_dir": "llm_runs",
+        "reset_output_csv": True,  # True にすると実行前にCSVをリセット
+        "csv_schema_version": "v2",  # Options: "v1" (old schema), "v2" (new schema with citations)
 
         # プロンプト
         "system_prompt": (
@@ -107,7 +113,7 @@ def _(display, json, pd):
         "claude_model": "claude-haiku-4-5-20251001",
         "gemini_model": "gemini-2.5-flash",
         "perplexity_model": "sonar-pro",
-        "xai_model": "grok-4",
+        "xai_model": "grok-4-1-fast-reasoning",
 
         # 検索設定（共通）
         "web_search": {
@@ -120,6 +126,7 @@ def _(display, json, pd):
             "search_mode": "web",
             "need_inline_citations": True,
             "max_uses": 5,
+            "claude_type": "web_search_20250305"
         },
 
         # 任意: Perplexity の extra_body 追加設定
@@ -147,28 +154,165 @@ def _(display, json, pd):
 
 @app.cell
 def _():
+    # CSV Schema v2 - 20 columns with citation and search result tracking
     CSV_COLUMNS = [
-        "run_id",
-        "prompt_id",
-        "requested_at",
-        "provider",
-        "model",
-        "base_url",
-        "note_id",
-        "note_text",
-        "system_prompt",
-        "user_prompt",
-        "response_text",
-        "finish_reason",
-        "prompt_tokens",
-        "completion_tokens",
-        "total_tokens",
-        "latency_ms",
-        "search_results_json",
-        "error",
-        "raw_json",
+        # Narrative information (input)
+        "narrative_id",           # old: note_id
+        "narrative_type",         # NEW: classification from input CSV
+        "narrative_prompt",       # old: note_text
+
+        # Model information
+        "model_name",             # old: provider
+        "model_version",          # old: model
+
+        # Answer information (output)
+        "answer_id",              # old: run_id
+        "answer_prompt",          # old: user_prompt
+        "answer_text",            # old: response_text
+        "answer_raw_json",        # old: raw_json
+        "answer_timestamp",       # old: requested_at
+        "answer_citation_list",   # NEW: JSON array of URLs
+
+        # Source information (citation tracking - NEW)
+        "source_id",              # NEW: citation identifier
+        "source_url",             # NEW: citation URL
+        "source_domain",          # NEW: extracted domain
+
+        # Result information (Perplexity search results - NEW)
+        "result_id",              # NEW: search result identifier
+        "result_url",             # NEW: search result URL
+        "result_domain",          # NEW: extracted domain
+        "result_title",           # NEW: search result title
+        "result_snippet",         # NEW: search result snippet
+        "result_rank",            # NEW: search result rank (1-N)
     ]
     return (CSV_COLUMNS,)
+
+
+@app.cell
+def _(Any, Dict, List, re, urlparse):
+    def extract_domain(url: str) -> str:
+        """
+        Extract domain from URL, removing only 'www.' prefix.
+
+        Returns empty string if URL is unparseable.
+
+        Examples:
+            "https://www.example.com/page" → "example.com"
+            "https://blog.example.com/page" → "blog.example.com"
+            "https://api.github.com/repos" → "api.github.com"
+            "https://ja.wikipedia.org/wiki/Page" → "ja.wikipedia.org"
+        """
+        if not url:
+            return ""
+
+        try:
+            # Handle missing scheme
+            if not url.startswith(('http://', 'https://')):
+                url = f"https://{url}"
+
+            parsed = urlparse(url)
+            domain = parsed.netloc
+
+            if not domain:
+                return ""
+
+            # Remove port if present
+            domain = domain.split(':')[0]
+
+            # Remove ONLY www. prefix (keep other subdomains)
+            if domain.startswith('www.'):
+                domain = domain[4:]
+
+            # Handle IDN (Internationalized Domain Names)
+            try:
+                domain = domain.encode('ascii').decode('idna')
+            except (UnicodeError, UnicodeDecodeError):
+                pass  # Already ASCII or invalid IDN
+
+            return domain.lower()
+
+        except Exception:
+            return ""
+
+
+    def extract_urls_from_text(text: str) -> List[str]:
+        """Extract URLs from OpenAI message content using regex."""
+        # RFC 3986 compliant URL pattern
+        url_pattern = r'https?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&/=]*)'
+        return re.findall(url_pattern, text or "")
+
+
+    def expand_citations_to_rows(
+        base_row: Dict[str, Any],
+        citations: List[Any],
+        results: List[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Expand one answer into multiple rows (one per citation).
+
+        Args:
+            base_row: Dict with narrative_*, model_*, answer_* fields
+            citations: List of citation URLs (strings) or dicts with {url, title, ...}
+            results: List of search result dicts (Perplexity only) or None
+
+        Returns:
+            List of row dicts ready for CSV writing
+        """
+        # Normalize citations to dict format
+        normalized_citations = []
+        for c in citations:
+            if isinstance(c, str):
+                normalized_citations.append({"url": c})
+            else:
+                normalized_citations.append(c)
+
+        # Handle empty citations
+        if not normalized_citations:
+            normalized_citations = [{}]  # One row with empty source_* fields
+
+        # Handle Perplexity results
+        if results is None:
+            results = [{}]  # Non-Perplexity case
+        elif not results:
+            results = [{}]  # Perplexity with no results
+
+        # Expand rows (Cartesian product for Perplexity)
+        expanded = []
+        for i, citation in enumerate(normalized_citations):
+            for j, result in enumerate(results):
+                row = base_row.copy()
+
+                # Citation fields
+                if citation and citation.get("url"):
+                    row["source_id"] = f"{base_row['answer_id']}_source_{i}"
+                    row["source_url"] = citation.get("url", "")
+                    row["source_domain"] = extract_domain(citation.get("url", ""))
+                else:
+                    row["source_id"] = ""
+                    row["source_url"] = ""
+                    row["source_domain"] = ""
+
+                # Result fields (Perplexity only)
+                if result and results != [{}]:
+                    row["result_id"] = f"{base_row['answer_id']}_result_{j}"
+                    row["result_url"] = result.get("url", "")
+                    row["result_domain"] = extract_domain(result.get("url", ""))
+                    row["result_title"] = result.get("title", "")
+                    row["result_snippet"] = result.get("snippet", "")
+                    row["result_rank"] = j + 1  # 1-based rank
+                else:
+                    row["result_id"] = ""
+                    row["result_url"] = ""
+                    row["result_domain"] = ""
+                    row["result_title"] = ""
+                    row["result_snippet"] = ""
+                    row["result_rank"] = ""
+
+                expanded.append(row)
+
+        return expanded
+    return expand_citations_to_rows, extract_urls_from_text
 
 
 @app.cell
@@ -195,6 +339,11 @@ def _(CFG, Path, pd):
                 "入力CSVに指定された列がありません。"
                 f"期待: `{note_id_col}` / 実際: {list(df_in.columns)}"
             )
+
+        # Optional narrative_type column (NEW for schema v2)
+        # Add empty column if missing - pipeline continues gracefully
+        if "narrative_type" not in df_in.columns:
+            df_in["narrative_type"] = ""
 
         return df_in, input_csv
 
@@ -225,6 +374,7 @@ def _(Any, CFG, Dict, List, Optional, dataclass, field):
         search_mode: Optional[str] = "web"
         need_inline_citations: bool = True
         max_uses: Optional[int] = 5
+        claude_type: Optional[str] = "web_search_20250305"
 
     def _merge_dicts(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
         merged = dict(base)
@@ -268,6 +418,8 @@ def _(Any, CFG, Dict, List, Optional, dataclass, field):
             tool_cfg["blocked_domains"] = ws.blocked_domains
         if ws.user_location:
             tool_cfg["user_location"] = ws.user_location
+        if ws.claude_type:
+            tool_cfg["type"] = ws.claude_type
         return tool_cfg
 
     def _gemini_use_google_search(ws: WebSearchConfig) -> bool:
@@ -356,6 +508,8 @@ def _(
     asyncio,
     csv,
     datetime,
+    expand_citations_to_rows,
+    extract_urls_from_text,
     json,
     os,
     pd,
@@ -466,20 +620,41 @@ def _(
             cfg: Any,
             note_id: Optional[str],
             note_text: str,
+            narrative_type: str,
             system_prompt: str,
             user_prompt: str,
         ) -> Dict[str, Any]:
+            # CSV Schema v2 with 20 columns
             return {
-                "run_id": run_id,
-                "prompt_id": prompt_id,
-                "requested_at": requested_at,
-                "provider": cfg.name,
-                "model": cfg.model,
-                "base_url": cfg.base_url,
-                "note_id": note_id,
-                "note_text": note_text,
-                "system_prompt": system_prompt,
-                "user_prompt": user_prompt,
+                # Narrative information (renamed from v1)
+                "narrative_id": note_id,             # old: note_id
+                "narrative_type": narrative_type,     # NEW: from input CSV
+                "narrative_prompt": note_text,        # old: note_text
+
+                # Model information (renamed from v1)
+                "model_name": cfg.name,               # old: provider
+                "model_version": cfg.model,           # old: model
+
+                # Answer information (renamed from v1 + new fields)
+                "answer_id": run_id,                  # old: run_id
+                "answer_prompt": user_prompt,         # old: user_prompt
+                "answer_text": "",                    # old: response_text (filled later)
+                "answer_raw_json": "",                # old: raw_json (filled later)
+                "answer_timestamp": requested_at,     # old: requested_at
+                "answer_citation_list": "[]",         # NEW (filled later)
+
+                # Source information (NEW - filled during row expansion)
+                "source_id": "",
+                "source_url": "",
+                "source_domain": "",
+
+                # Result information (NEW - filled during row expansion)
+                "result_id": "",
+                "result_url": "",
+                "result_domain": "",
+                "result_title": "",
+                "result_snippet": "",
+                "result_rank": "",
             }
 
         def _success_row_local(
@@ -490,6 +665,7 @@ def _(
             cfg: Any,
             note_id: Optional[str],
             note_text: str,
+            narrative_type: str,
             system_prompt: str,
             user_prompt: str,
             response_text: Optional[str],
@@ -500,7 +676,9 @@ def _(
             latency_ms: int,
             search_results_json: Optional[str],
             raw_json: Optional[str],
+            citations: List[str],
         ) -> Dict[str, Any]:
+            # Get base row with v2 schema
             row = _base_row_local(
                 run_id=run_id,
                 prompt_id=prompt_id,
@@ -508,22 +686,14 @@ def _(
                 cfg=cfg,
                 note_id=note_id,
                 note_text=note_text,
+                narrative_type=narrative_type,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
             )
-            row.update(
-                {
-                    "response_text": response_text,
-                    "finish_reason": finish_reason,
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens,
-                    "latency_ms": latency_ms,
-                    "search_results_json": search_results_json,
-                    "error": None,
-                    "raw_json": raw_json,
-                }
-            )
+            # Update with answer fields
+            row["answer_text"] = response_text or ""
+            row["answer_raw_json"] = raw_json or "{}"
+            row["answer_citation_list"] = json.dumps(citations, ensure_ascii=False)
             return row
 
         def _error_row_local(
@@ -532,6 +702,7 @@ def _(
             prompt_id: str,
             note_id: Optional[str],
             note_text: str,
+            narrative_type: str,
             system_prompt: str,
             user_prompt: str,
             error_msg: str,
@@ -541,6 +712,9 @@ def _(
         ) -> Dict[str, Any]:
             run_id = run_id or str(uuid.uuid4())
             requested_at = requested_at or _now_iso()
+            # Note: In v2 schema, we don't write error rows to CSV
+            # Errors are logged only. This function kept for compatibility
+            # but won't be called in the new flow
             row = _base_row_local(
                 run_id=run_id,
                 prompt_id=prompt_id,
@@ -548,22 +722,11 @@ def _(
                 cfg=cfg,
                 note_id=note_id,
                 note_text=note_text,
+                narrative_type=narrative_type,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
             )
-            row.update(
-                {
-                    "response_text": None,
-                    "finish_reason": None,
-                    "prompt_tokens": None,
-                    "completion_tokens": None,
-                    "total_tokens": None,
-                    "latency_ms": latency_ms,
-                    "search_results_json": None,
-                    "error": error_msg,
-                    "raw_json": None,
-                }
-            )
+            # In v2, error handling is different - we just log, not write to CSV
             return row
 
         def _extract_anthropic_text_local(resp: Any) -> Optional[str]:
@@ -620,11 +783,16 @@ def _(
                 prompt_id: str,
                 note_id: Optional[str],
                 note_text: str,
+                narrative_type: str,
                 system_prompt: str,
                 user_prompt: str,
                 temperature: float,
                 max_tokens: int,
             ) -> Dict[str, Any]:
+                """
+                Call the provider and return a dict with base_row, citations, and results.
+                Returns dict with keys: base_row, citations, results
+                """
                 run_id = str(uuid.uuid4())
                 requested_at = _now_iso()
                 t0 = time.perf_counter()
@@ -648,13 +816,16 @@ def _(
                     _log_local(
                         f"{self.cfg.name} ok note_id={note_id} latency_ms={latency_ms}"
                     )
-                    return _success_row_local(
+
+                    # Build success row
+                    base_row = _success_row_local(
                         run_id=run_id,
                         prompt_id=prompt_id,
                         requested_at=requested_at,
                         cfg=self.cfg,
                         note_id=note_id,
                         note_text=note_text,
+                        narrative_type=narrative_type,
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
                         response_text=parsed.get("response_text"),
@@ -665,25 +836,25 @@ def _(
                         latency_ms=latency_ms,
                         search_results_json=parsed.get("search_results_json"),
                         raw_json=parsed.get("raw_json"),
+                        citations=parsed.get("citations", []),
                     )
+
+                    # Return dict with base_row, citations, and results for row expansion
+                    return {
+                        "base_row": base_row,
+                        "citations": parsed.get("citations", []),
+                        "results": parsed.get("results", []),
+                        "provider_name": self.cfg.name,
+                    }
+
                 except Exception as e:
                     latency_ms = int((time.perf_counter() - t0) * 1000)
                     _log_local(
                         f"{self.cfg.name} error note_id={note_id} "
                         f"{type(e).__name__}: {e}"
                     )
-                    return _error_row_local(
-                        cfg=self.cfg,
-                        prompt_id=prompt_id,
-                        note_id=note_id,
-                        note_text=note_text,
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        error_msg=f"{type(e).__name__}: {e}",
-                        latency_ms=latency_ms,
-                        run_id=run_id,
-                        requested_at=requested_at,
-                    )
+                    # For errors, return None to signal skip (errors logged, not written in v2)
+                    return None
 
         class OpenAIAdapter(ProviderAdapter):
             def build_request(
@@ -723,12 +894,39 @@ def _(
                 )
                 msg = getattr(choice0, "message", None) if choice0 else None
                 text = getattr(msg, "content", None) if msg else None
+
+                # Extract citations from response text for OpenAI
+                citations = extract_urls_from_text(text or "")
+
+                # Extract Perplexity search results if available
+                results = []
                 search_results = getattr(resp, "search_results", None)
                 search_results_json = (
                     json.dumps(search_results, default=str)
                     if search_results is not None
                     else None
                 )
+
+                # For Perplexity provider, extract structured search results
+                if search_results and self.cfg.name == "perplexity":
+                    for r in search_results:
+                        if isinstance(r, dict):
+                            results.append({
+                                "url": r.get("url", ""),
+                                "title": r.get("title", ""),
+                                "snippet": r.get("snippet", ""),
+                            })
+                    # Also extract citations from Perplexity's citations array
+                    perplexity_citations = getattr(resp, "citations", None)
+                    if perplexity_citations:
+                        citations = list(perplexity_citations)
+
+                # Extract citations from xAI/Grok if available
+                if self.cfg.name == "xai":
+                    xai_citations = getattr(resp, "citations", None)
+                    if xai_citations:
+                        citations = [c.get("url", c) if isinstance(c, dict) else c for c in xai_citations]
+
                 usage_fields = _usage_fields_local(resp)
                 return {
                     "response_text": text,
@@ -738,6 +936,8 @@ def _(
                     "total_tokens": usage_fields.get("total_tokens"),
                     "search_results_json": search_results_json,
                     "raw_json": _dump_response_local(resp),
+                    "citations": citations,  # NEW: list of URLs
+                    "results": results,      # NEW: Perplexity search results
                 }
 
         class AnthropicAdapter(ProviderAdapter):
@@ -798,6 +998,25 @@ def _(
                     if prompt_tokens is not None and completion_tokens is not None
                     else None
                 )
+
+                # Extract citations from tool_use blocks (Claude web_search)
+                citations = []
+                content = getattr(resp, "content", None) or []
+                for block in content:
+                    if getattr(block, "type", None) == "tool_use":
+                        tool_name = getattr(block, "name", None)
+                        if tool_name == "web_search":
+                            tool_input = getattr(block, "input", {})
+                            results = tool_input.get("results", [])
+                            for result in results:
+                                url = result.get("url")
+                                if url:
+                                    citations.append(url)
+
+                # Fallback: If no citations from tool_use, extract URLs from text
+                if not citations and text:
+                    citations = extract_urls_from_text(text)
+
                 return {
                     "response_text": text,
                     "finish_reason": finish_reason,
@@ -806,6 +1025,8 @@ def _(
                     "total_tokens": total_tokens,
                     "search_results_json": None,
                     "raw_json": _dump_response_local(resp),
+                    "citations": citations,  # NEW: list of URLs from tool_use or text
+                    "results": [],           # No search results for Claude
                 }
 
         class GeminiAdapter(ProviderAdapter):
@@ -871,6 +1092,20 @@ def _(
                 total_tokens = (
                     getattr(usage, "total_token_count", None) if usage else None
                 )
+
+                # Extract citations from grounding_metadata
+                citations = []
+                if candidates:
+                    grounding_metadata = getattr(candidates[0], "grounding_metadata", None)
+                    if grounding_metadata:
+                        grounding_chunks = getattr(grounding_metadata, "grounding_chunks", [])
+                        for chunk in grounding_chunks:
+                            web_chunk = getattr(chunk, "web", None)
+                            if web_chunk:
+                                uri = getattr(web_chunk, "uri", None)
+                                if uri:
+                                    citations.append(uri)
+
                 return {
                     "response_text": text,
                     "finish_reason": finish_reason,
@@ -879,6 +1114,8 @@ def _(
                     "total_tokens": total_tokens,
                     "search_results_json": None,
                     "raw_json": _dump_response_local(resp),
+                    "citations": citations,  # NEW: list of URLs from grounding_metadata
+                    "results": [],           # No search results for Gemini
                 }
 
         CLIENT_FACTORIES = {
@@ -895,15 +1132,51 @@ def _(
         out_dir = Path(CFG["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        def _append_row_local(csv_path: Path, row: Dict[str, Any]) -> None:
+        # CSVリセットオプションが有効な場合、既存CSVを削除
+        if CFG.get("reset_output_csv", False):
+            for cfg in PROVIDERS:
+                csv_path = out_dir / f"{cfg.name}.csv"
+                if csv_path.exists():
+                    csv_path.unlink()
+                    _log_local(f"既存CSVを削除しました: {csv_path}")
+
+        def _append_row_local(
+            csv_path: Path,
+            base_row: Dict[str, Any],
+            citations: List[Any],
+            results: List[Dict[str, Any]] = None
+        ) -> int:
+            """
+            Write expanded rows for a single API response.
+
+            Args:
+                csv_path: Path to the CSV file
+                base_row: Base row dict with narrative_*, model_*, answer_* fields
+                citations: List of citation URLs or dicts
+                results: List of search result dicts (Perplexity only) or None
+
+            Returns:
+                Number of rows written
+            """
             csv_path.parent.mkdir(parents=True, exist_ok=True)
             file_exists = csv_path.exists()
-            safe_row = {k: row.get(k, None) for k in CSV_COLUMNS}
+
+            # Expand rows (citations × results for Perplexity)
+            # expand_citations_to_rows is defined in the utility cell
+            expanded_rows = expand_citations_to_rows(base_row, citations, results)
+
+            # Write rows incrementally
+            rows_written = 0
             with csv_path.open("a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
                 if not file_exists:
                     writer.writeheader()
-                writer.writerow(safe_row)
+                for row in expanded_rows:
+                    safe_row = {k: row.get(k, None) for k in CSV_COLUMNS}
+                    writer.writerow(safe_row)
+                    rows_written += 1
+
+            return rows_written
 
         system_prompt = CFG["system_prompt"]
         template = CFG["user_prompt_template"]
@@ -959,7 +1232,10 @@ def _(
                 async def process_record(
                     idx: int, record: Dict[str, Any]
                 ) -> List[Dict[str, Any]]:
+                    """Process one input record and return list of result dicts for all providers."""
                     note_text = _normalize_text_local(record.get(note_text_col, ""))
+                    narrative_type = _normalize_text_local(record.get("narrative_type", ""))
+
                     if note_id_col:
                         note_id_raw = record.get(note_id_col)
                         note_id = (
@@ -972,56 +1248,28 @@ def _(
                     prompt_id = str(uuid.uuid4())
 
                     if not note_text:
-                        return [
-                            _error_row_local(
-                                cfg=cfg,
-                                prompt_id=prompt_id,
-                                note_id=note_id,
-                                note_text=note_text,
-                                system_prompt=system_prompt,
-                                user_prompt="",
-                                error_msg="ノート本文が空です",
-                            )
-                            for cfg in PROVIDERS
-                        ]
+                        # Skip empty note_text - just log, don't write error rows in v2
+                        _log_local(f"Skipping empty note_text for note_id={note_id}")
+                        return []
 
                     user_prompt = _safe_format_local(template, note_text=note_text)
 
-                    rows: List[Dict[str, Any]] = []
+                    results: List[Dict[str, Any]] = []
                     tasks = []
                     for cfg in PROVIDERS:
                         if cfg.name in provider_errors:
-                            rows.append(
-                                _error_row_local(
-                                    cfg=cfg,
-                                    prompt_id=prompt_id,
-                                    note_id=note_id,
-                                    note_text=note_text,
-                                    system_prompt=system_prompt,
-                                    user_prompt=user_prompt,
-                                    error_msg=provider_errors[cfg.name],
-                                )
-                            )
+                            _log_local(f"Skipping {cfg.name} for note_id={note_id}: {provider_errors[cfg.name]}")
                             continue
                         adapter = adapters.get(cfg.name)
                         if adapter is None:
-                            rows.append(
-                                _error_row_local(
-                                    cfg=cfg,
-                                    prompt_id=prompt_id,
-                                    note_id=note_id,
-                                    note_text=note_text,
-                                    system_prompt=system_prompt,
-                                    user_prompt=user_prompt,
-                                    error_msg="アダプタが初期化されていません",
-                                )
-                            )
+                            _log_local(f"Skipping {cfg.name} for note_id={note_id}: adapter not initialized")
                             continue
                         tasks.append(
                             adapter.call(
                                 prompt_id=prompt_id,
                                 note_id=note_id,
                                 note_text=note_text,
+                                narrative_type=narrative_type,
                                 system_prompt=system_prompt,
                                 user_prompt=user_prompt,
                                 temperature=float(CFG["temperature"]),
@@ -1029,17 +1277,53 @@ def _(
                             )
                         )
                     if tasks:
-                        rows.extend(await asyncio.gather(*tasks))
-                    return rows
+                        # Gather results from all providers
+                        # return_exceptions=True ensures one provider's failure doesn't stop others
+                        task_results = await asyncio.gather(*tasks, return_exceptions=True)
+                        # Filter out None (errors) and exceptions, collect valid results
+                        results = []
+                        for r in task_results:
+                            if r is None:
+                                continue  # Error case that returned None
+                            if isinstance(r, Exception):
+                                # Log exception that wasn't caught
+                                _log_local(f"Uncaught exception in provider task: {type(r).__name__}: {r}")
+                                continue
+                            results.append(r)
+                    return results
 
+                # Process all records in batch, don't let one failure stop others
                 batch_results = await asyncio.gather(
-                    *(process_record(i + start, record) for i, record in enumerate(batch))
+                    *(process_record(i + start, record) for i, record in enumerate(batch)),
+                    return_exceptions=True
                 )
 
-                for record_rows in batch_results:
-                    for row in record_rows:
-                        csv_path = out_dir / f"{row['provider']}.csv"
-                        _append_row_local(csv_path, row)
+                # Process results: each result dict contains base_row, citations, results, provider_name
+                for record_results in batch_results:
+                    # Skip if entire record failed with exception
+                    if isinstance(record_results, Exception):
+                        _log_local(f"Record processing failed: {type(record_results).__name__}: {record_results}")
+                        continue
+                    if not isinstance(record_results, list):
+                        continue
+                    for result_dict in record_results:
+                        if result_dict is None:
+                            continue  # Skip errors
+                        provider_name = result_dict.get("provider_name")
+                        if not provider_name:
+                            continue
+                        csv_path = out_dir / f"{provider_name}.csv"
+                        base_row = result_dict.get("base_row", {})
+                        citations = result_dict.get("citations", [])
+                        results = result_dict.get("results", [])
+
+                        # Write expanded rows (citations × results)
+                        rows_written = _append_row_local(csv_path, base_row, citations, results)
+                        _log_local(
+                            f"{provider_name}: answer_id={base_row.get('answer_id', 'N/A')} "
+                            f"created {rows_written} rows from {len(citations)} citations"
+                        )
+
                 _log_local(
                     f"batch done rows {start + 1}-{start + len(batch)}"
                 )

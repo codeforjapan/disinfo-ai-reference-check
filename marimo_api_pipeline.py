@@ -24,9 +24,20 @@ def _():
     try:
         from dotenv import load_dotenv  # type: ignore
 
-        load_dotenv()
-    except Exception:
-        pass
+        # カレントディレクトリと親ディレクトリの.envを試す
+        env_loaded = load_dotenv() or load_dotenv(Path.cwd() / ".env") or load_dotenv(Path(__file__).parent / ".env" if "__file__" in dir() else None)
+        if not env_loaded:
+            # 最後の手段：find_dotenvで自動検索
+            from dotenv import find_dotenv
+            env_file = find_dotenv()
+            if env_file:
+                load_dotenv(env_file)
+            else:
+                print("警告: .envファイルが見つかりませんでした")
+    except ImportError:
+        print("警告: python-dotenvがインストールされていません")
+    except Exception as e:
+        print(f"警告: .envの読み込みエラー: {e}")
     return (
         Any,
         AsyncOpenAI,
@@ -92,7 +103,7 @@ def _(display, json, pd):
         "log_preview_chars": 40,
 
         # プロバイダ
-        "openai_model": "gpt-4o-mini-search-preview",
+        "openai_model": "gpt-5-search-api",
         "claude_model": "claude-haiku-4-5-20251001",
         "gemini_model": "gemini-2.5-flash",
         "perplexity_model": "sonar-pro",
